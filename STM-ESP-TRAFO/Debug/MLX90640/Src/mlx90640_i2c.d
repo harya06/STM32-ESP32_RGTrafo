@@ -1,4 +1,6 @@
-Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
+MLX90640/Src/mlx90640_i2c.o: ../MLX90640/Src/mlx90640_i2c.c \
+ C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_i2c.h \
+ C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_types.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h \
  ../Core/Inc/stm32f4xx_hal_conf.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc.h \
@@ -27,19 +29,9 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr_ex.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_spi.h \
- ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h \
- ../FATFS/App/fatfs.h ../Middlewares/Third_Party/FatFs/src/ff.h \
- ../Middlewares/Third_Party/FatFs/src/integer.h ../FATFS/Target/ffconf.h \
- ../Middlewares/Third_Party/FatFs/src/ff_gen_drv.h \
- ../Middlewares/Third_Party/FatFs/src/diskio.h \
- ../Middlewares/Third_Party/FatFs/src/ff.h ../FATFS/Target/user_diskio.h \
- ../Core/Inc/PZEM_6L24.h \
- C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_driver.h \
- C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_device.h \
- C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_types.h \
- C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_core.h \
- C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_i2c.h
-../Core/Inc/main.h:
+ ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h
+C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_i2c.h:
+C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_types.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc.h:
@@ -69,17 +61,3 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr_ex.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_spi.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h:
-../FATFS/App/fatfs.h:
-../Middlewares/Third_Party/FatFs/src/ff.h:
-../Middlewares/Third_Party/FatFs/src/integer.h:
-../FATFS/Target/ffconf.h:
-../Middlewares/Third_Party/FatFs/src/ff_gen_drv.h:
-../Middlewares/Third_Party/FatFs/src/diskio.h:
-../Middlewares/Third_Party/FatFs/src/ff.h:
-../FATFS/Target/user_diskio.h:
-../Core/Inc/PZEM_6L24.h:
-C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_driver.h:
-C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_device.h:
-C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_types.h:
-C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_core.h:
-C:/Users/harya/STM32CubeIDE/workspace_1.19.0/STM-ESP-TRAFO/MLX90640/Inc/mlx90640_i2c.h:

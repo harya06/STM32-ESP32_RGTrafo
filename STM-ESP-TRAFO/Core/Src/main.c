@@ -23,8 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "PZEM_6L24.h"
-#include "MLX90640_API.h"
-#include "MLX90640_I2C_Driver.h"
+#include "mlx90640_driver.h"
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -49,15 +48,6 @@ typedef struct {
     PhaseData_t phase[3];   /* indeks: 0 = A, 1 = B, 2 = C */
     uint16_t    faultCode;
 } Electrical_t;
-
-/* Struktur data thermal MLX90640 */
-typedef struct {
-    float Ta;           /* suhu ambient / sensor */
-    float minTemp;
-    float maxTemp;
-    float avgTemp;
-    float centerTemp;   /* pixel tengah (opsional) */
-} ThermalData_t;
 
 /* Struktur data RTC DS3231 */
 typedef struct {
@@ -116,32 +106,53 @@ UART_HandleTypeDef huart6;
 /* USER CODE BEGIN PV */
 
 /* ----- MLX90640 ----- */
-paramsMLX90640 mlx90640;
-uint16_t eeMLX90640[832];
-uint16_t mlx90640Frame[834];
-float mlx90640To[768];
+MLX90640_Device_t camera1;  /* Camera on I2C1 */
+MLX90640_Device_t camera2;  /* Camera on I2C2 */
 
 /* ----- Data terstruktur untuk debugging ----- */
-volatile Electrical_t  elecData;
-volatile ThermalData_t thermData;
+volatile Electrical_t elecData;
 /* ----- PZEM ----- */
 PZEM6L24_t pzem;
 static uint8_t connFailCount = 0U;
 
 /* ----- RTC DS3131 ----- */
 volatile RTC_DS3231_t  rtcData;
+
+SDCard_Class sd;
+
+/* ----- DEBUG STRUCT ----- */
+typedef struct {
+    uint8_t init_success;
+    int32_t init_error_code;
+
+    uint32_t frame_attempt_count;
+    uint32_t frame_success_count;
+    uint32_t frame_fail_count;
+
+    int32_t last_getframe_result;
+    int32_t last_calc_result;
+
+    uint16_t i2c_status_reg;
+    uint16_t i2c_ctrl_reg;
+
+    uint8_t data_ready_flag;
+    uint32_t timeout_counter;
+
+} MLX_Debug_t;
+
+volatile MLX_Debug_t mlx_debug;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_I2C2_Init(void);
 static void MX_I2C3_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 static void MX_SPI2_Init(void);
+static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
 
 static uint16_t CheckVoltageFault(float vA, float vB, float vC);
@@ -155,7 +166,9 @@ static HAL_StatusTypeDef DS3231_SetTime(RTC_DS3231_t *rtc);
 static uint8_t SD_mount(void *self);
 static uint8_t SD_createFile(void *self, const char *filename);
 static uint8_t SD_append(void *self, const char *filename, const char *text);
-SDCard_Class sd;
+
+
+uint8_t Test_I2C_MLX90640(I2C_HandleTypeDef *hi2c, uint8_t addr);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -193,228 +206,341 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
-  MX_I2C2_Init();
   MX_I2C3_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART6_UART_Init();
   MX_SPI2_Init();
   MX_FATFS_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
-  /* LED indikator koneksi PZEM (awalnya nyala = belum terhubung) */
-   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+  /* Clear debug struct */
+  memset((void*)&mlx_debug, 0, sizeof(mlx_debug));
 
-   /* Inisialisasi PZEM */
-   PZEM_Init(&pzem, &huart2, 0x01);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
 
-   /* ===================== */
-   /* Inisialisasi MLX90640 */
-   /* ===================== */
-   if (MLX90640_DumpEE(0x33, eeMLX90640) != 0)
-   {
-       /* EEPROM error → fault permanen, LED merah */
-       while (1)
-       {
-           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
-           HAL_Delay(200);
-           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
-           HAL_Delay(200);
-       }
-   }
+  PZEM_Init(&pzem, &huart2, 0x01);
 
-   if (MLX90640_ExtractParameters(eeMLX90640, &mlx90640) < 0)
-   {
-       /* Parameter error */
-       while (1)
-       {
-           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
-           HAL_Delay(100);
-           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
-           HAL_Delay(100);
-       }
-   }
+  /* ========================================================================== */
+  /*          MANUAL I2C TEST - READ STATUS REGISTER (BOTH CAMERAS)            */
+  /* ========================================================================== */
 
-   MLX90640_SetChessMode(0x33);
-   MLX90640_SetRefreshRate(0x33, 0x03);  /* 4 Hz */
+  HAL_Delay(200);  /* Wait for everything to stabilize */
 
-   /* Inisialisasi struktur data ke nol */
-   memset(&elecData, 0, sizeof(elecData));
-   memset(&thermData, 0, sizeof(thermData));
+  /* --- TEST CAMERA 1 (I2C1) --- */
+  HAL_StatusTypeDef status1 = HAL_I2C_IsDeviceReady(&hi2c1, (0x33 << 1), 3, 100);
+  uint8_t cam1_found = 0;
 
-   /* ===================== */
-   /* Inisialisasi DS3231   */
-   /* ===================== */
+  if (status1 == HAL_OK) {
+      uint8_t reg_data[2];
+      if (HAL_I2C_Mem_Read(&hi2c1, (0x33 << 1), 0x8000,
+                           I2C_MEMADD_SIZE_16BIT, reg_data, 2, 1000) == HAL_OK) {
+          uint16_t status_reg = (reg_data[1] << 8) | reg_data[0];
+          if (status_reg != 0x0000 && status_reg != 0xFFFF) {
+              cam1_found = 1;
+          }
+      }
+  }
 
-   rtcData.second = 0;
-   rtcData.minute = 18;
-   rtcData.hour   = 18;
-   rtcData.day    = 3;      /* Rabu */
-   rtcData.date   = 3;
-   rtcData.month  = 6;
-   rtcData.year   = 2026;
+  /* --- TEST CAMERA 2 (I2C2) --- */
+  HAL_StatusTypeDef status2 = HAL_I2C_IsDeviceReady(&hi2c2, (0x33 << 1), 3, 100);
+  uint8_t cam2_found = 0;
 
-   /* Set hanya sekali saat awal flashing */
-   /* Setelah itu bisa dikomentari */
-//   DS3231_SetTime(&rtcData);
+  if (status2 == HAL_OK) {
+      uint8_t reg_data[2];
+      if (HAL_I2C_Mem_Read(&hi2c2, (0x33 << 1), 0x8000,
+                           I2C_MEMADD_SIZE_16BIT, reg_data, 2, 1000) == HAL_OK) {
+          uint16_t status_reg = (reg_data[1] << 8) | reg_data[0];
+          if (status_reg != 0x0000 && status_reg != 0xFFFF) {
+              cam2_found = 1;
+          }
+      }
+  }
 
-   /* ===================== */
-   /* SD Card Object Init   */
-   /* ===================== */
+  /* Set Debug Status based on findings */
+  if (cam1_found && cam2_found) mlx_debug.init_success = 2; // Both OK
+  else if (cam1_found || cam2_found) mlx_debug.init_success = 1; // One OK
+  else mlx_debug.init_success = 0; // None OK
 
-   sd.mount      = SD_mount;
-   sd.createFile = SD_createFile;
-   sd.append     = SD_append;
+  /* Blink LED to show result */
+  if (mlx_debug.init_success >= 1) {
+      /* I2C OK - blink 2 times slow */
+      for (int i = 0; i < 2; i++) {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+          HAL_Delay(200);
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+          HAL_Delay(200);
+      }
+  } else {
+      /* I2C FAILED - blink 5 times fast */
+      for (int i = 0; i < 5; i++) {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+          HAL_Delay(50);
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+          HAL_Delay(50);
+      }
+  }
 
-   if (sd.mount(&sd))
-   {
-       sd.createFile(&sd, "LOG.CSV");
-   }
+  /* ========================================================================== */
+  /*          NOW TRY MLX INIT (BOTH CAMERAS)                                  */
+  /* ========================================================================== */
+
+  /* Init Camera 1 */
+  if (cam1_found) {
+      MLX90640_Status_t cam1_status = MLX90640_Init(&camera1, &hi2c1, 0x33);
+      if (cam1_status == MLX90640_OK) {
+          MLX90640_SetMode(&camera1, MLX90640_MODE_CHESS);
+          MLX90640_SetRefreshRate(&camera1, MLX90640_REFRESH_4_HZ);
+      }
+  }
+
+  /* Init Camera 2 */
+  if (cam2_found) {
+      MLX90640_Status_t cam2_status = MLX90640_Init(&camera2, &hi2c2, 0x33);
+      if (cam2_status == MLX90640_OK) {
+          MLX90640_SetMode(&camera2, MLX90640_MODE_CHESS);
+          MLX90640_SetRefreshRate(&camera2, MLX90640_REFRESH_4_HZ);
+          mlx_debug.init_success = 3;  /* 3 = Full init OK (at least one) */
+      }
+  }
+
+  HAL_Delay(500);
+
+  memset((void*)&elecData, 0, sizeof(elecData));
+
+  /* RTC Setup */
+  rtcData.second = 0;
+  rtcData.minute = 29;
+  rtcData.hour = 16;
+  rtcData.day = 7;
+  rtcData.date = 7;
+  rtcData.month = 6;
+  rtcData.year = 2026;
+
+  /* Uncomment to set RTC time (only once) */
+//   DS3231_SetTime((RTC_DS3231_t*)&rtcData);
+
+  /* SD Card initialization */
+  sd.mount = SD_mount;
+  sd.createFile = SD_createFile;
+  sd.append = SD_append;
+
+  if (sd.mount(&sd)) {
+      sd.createFile(&sd, "LOG.CSV");
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  static uint32_t alive = 0;
-	  alive++;
+	    static uint32_t alive = 0;
+	    alive++;
 
-	   /* ============================================= */
-	    /*               BACA PZEM (3 FASA)              */
-	    /* ============================================= */
-	    if (pzem.state == PZEM_STATE_FAULT || pzem.state == PZEM_STATE_ERROR)
-	    {
+	    /* ======================================================================== */
+	    /*                       READ PZEM (UNCHANGED)                              */
+	    /* ======================================================================== */
+
+	    if (pzem.state == PZEM_STATE_FAULT || pzem.state == PZEM_STATE_ERROR) {
 	        HAL_UART_Abort(pzem.huart);
 	        pzem.state = PZEM_STATE_IDLE;
 	    }
 
-	    if (PZEM_IT_RequestAll(&pzem) == HAL_OK)
-	    {
+	    if (PZEM_IT_RequestAll(&pzem) == HAL_OK) {
 	        uint32_t t0 = HAL_GetTick();
-	        while (pzem.state == PZEM_STATE_TX || pzem.state == PZEM_STATE_RX)
-	        {
-	            if (HAL_GetTick() - t0 > 2000U)
-	            {
+	        while (pzem.state == PZEM_STATE_TX || pzem.state == PZEM_STATE_RX) {
+	            if (HAL_GetTick() - t0 > 2000U) {
 	                HAL_UART_Abort(pzem.huart);
 	                pzem.state = PZEM_STATE_ERROR;
 	                break;
 	            }
 	        }
 
-	        if (pzem.state == PZEM_STATE_COMPLETE)
-	        {
-	            if (PZEM_IT_ProcessData(&pzem) == HAL_OK)
-	            {
-	                /* Simpan ke struct 3 fasa */
-	                for (int i = 0; i < 3; i++)
-	                {
-	                    elecData.phase[i].voltage   = pzem.voltage[i];
-	                    elecData.phase[i].current   = pzem.current[i];
-	                    elecData.phase[i].power     = pzem.power[i];
+	        if (pzem.state == PZEM_STATE_COMPLETE) {
+	            if (PZEM_IT_ProcessData(&pzem) == HAL_OK) {
+	                for (int i = 0; i < 3; i++) {
+	                    elecData.phase[i].voltage = pzem.voltage[i];
+	                    elecData.phase[i].current = pzem.current[i];
+	                    elecData.phase[i].power = pzem.power[i];
 	                    elecData.phase[i].frequency = pzem.frequency[i];
-	                    elecData.phase[i].pf        = pzem.pf[i];
-	                    elecData.phase[i].va        = pzem.va[i];
-	                    elecData.phase[i].var       = pzem.var[i];
-	                    elecData.phase[i].phi       = pzem.phi[i];
-	                    elecData.phase[i].theta     = pzem.theta[i];
+	                    elecData.phase[i].pf = pzem.pf[i];
+	                    elecData.phase[i].va = pzem.va[i];
+	                    elecData.phase[i].var = pzem.var[i];
+	                    elecData.phase[i].phi = pzem.phi[i];
+	                    elecData.phase[i].theta = pzem.theta[i];
 	                }
 
 	                connFailCount = 0U;
 	                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
 
-	                /* Evaluasi fault tegangan */
 	                elecData.faultCode = CheckVoltageFault(
 	                    elecData.phase[0].voltage,
 	                    elecData.phase[1].voltage,
-	                    elecData.phase[2].voltage);
+	                    elecData.phase[2].voltage
+	                );
 	                UpdateFaultCode(elecData.faultCode);
 	            }
-	        }
-	        else
-	        {
+	        } else {
 	            HAL_UART_Abort(pzem.huart);
 	            pzem.state = PZEM_STATE_IDLE;
 
 	            if (connFailCount < PZEM_CONN_RETRY)
 	                connFailCount++;
 
-	            if (connFailCount >= PZEM_CONN_RETRY)
-	            {
+	            if (connFailCount >= PZEM_CONN_RETRY) {
 	                elecData.faultCode = 404U;
 	                UpdateFaultCode(404U);
 	                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
 	            }
 	        }
-	    }
-	    else
-	    {
+	    } else {
 	        HAL_UART_Abort(pzem.huart);
 	        pzem.state = PZEM_STATE_IDLE;
 	    }
 
-	    /* ============================================= */
-	    /*               BACA MLX90640                   */
-	    /* ============================================= */
-	    if (MLX90640_GetFrameData(0x33, mlx90640Frame) >= 0)
-	    {
-	        float Ta = MLX90640_GetTa(mlx90640Frame, &mlx90640);
-	        float emissivity = 0.95f;
 
-	        MLX90640_CalculateTo(mlx90640Frame, &mlx90640, emissivity, Ta, mlx90640To);
+	    /* ======================================================================== */
+	    /*   READ BOTH CAMERAS                                                      */
+	    /* ======================================================================== */
 
-	        float minTemp = 1000.0f;
-	        float maxTemp = -1000.0f;
-	        float sumTemp = 0.0f;
+	    static uint32_t last_mlx_read = 0;
 
-	        for (int i = 0; i < 768; i++)
-	        {
-	            float t = mlx90640To[i];
-	            sumTemp += t;
-	            if (t < minTemp) minTemp = t;
-	            if (t > maxTemp) maxTemp = t;
+	    if ((HAL_GetTick() - last_mlx_read) >= 250) {
+	        last_mlx_read = HAL_GetTick();
+	        mlx_debug.frame_attempt_count++;
+
+	        /* --- Camera 1 (I2C1) --- */
+	        if (camera1.is_initialized) {
+	            if (hi2c1.ErrorCode != HAL_I2C_ERROR_NONE) {
+	                hi2c1.ErrorCode = HAL_I2C_ERROR_NONE;
+	            }
+	            int result1 = MLX90640_GetFrameData(&camera1);
+	            if (result1 >= 0) {
+	                mlx_debug.frame_success_count++;
+	                MLX90640_CalculateTemperatures(&camera1, 0.95f, camera1.ambient_temp);
+	                mlx_debug.last_calc_result = 0;
+	            } else {
+	                mlx_debug.frame_fail_count++;
+	            }
 	        }
 
-	        thermData.Ta         = Ta;
-	        thermData.minTemp    = minTemp;
-	        thermData.maxTemp    = maxTemp;
-	        thermData.avgTemp    = sumTemp / 768.0f;
-	        thermData.centerTemp = mlx90640To[384];   /* pixel tengah */
+	        /* --- Camera 2 (I2C2) --- */
+	        if (camera2.is_initialized) {
+	            if (hi2c2.ErrorCode != HAL_I2C_ERROR_NONE) {
+	                hi2c2.ErrorCode = HAL_I2C_ERROR_NONE;
+	            }
+	            int result2 = MLX90640_GetFrameData(&camera2);
+	            if (result2 >= 0) {
+	                mlx_debug.frame_success_count++;
+	                MLX90640_CalculateTemperatures(&camera2, 0.95f, camera2.ambient_temp);
+	                mlx_debug.last_calc_result = 0;
+	            } else {
+	                mlx_debug.frame_fail_count++;
+	            }
+	        }
 	    }
 
-	    /* ----- Baca RTC ----- */
+	    /* ======================================================================== */
+	    /*                          READ RTC                                        */
+	    /* ======================================================================== */
+
 	    DS3231_GetTime(&rtcData);
+
+	    /* ======================================================================== */
+	    /*                   ENHANCED SD CARD LOGGING (UPDATED)                     */
+	    /* ======================================================================== */
 
 	    static uint32_t lastLog = 0;
 
-	    if (HAL_GetTick() - lastLog > 5000)
-	    {
+	    if (HAL_GetTick() - lastLog > 5000) {  // Log setiap 5 detik
 	        lastLog = HAL_GetTick();
 
-	        char line[200];
+	        char line[512];  // Buffer lebih besar untuk semua data
 
 	        sprintf(line,
+	            // --- Timestamp ---
 	            "%02d/%02d/%04d,%02d:%02d:%02d,"
-	            "%.2f,%.2f,%.2f,"
-	            "%.2f,%.2f\r\n",
 
-	            rtcData.date,
-	            rtcData.month,
-	            rtcData.year,
-	            rtcData.hour,
-	            rtcData.minute,
-	            rtcData.second,
+	            // --- Phase A (9 parameters) ---
+	            "%.2f,%.3f,%.2f,%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,"
 
+	            // --- Phase B (9 parameters) ---
+	            "%.2f,%.3f,%.2f,%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,"
+
+	            // --- Phase C (9 parameters) ---
+	            "%.2f,%.3f,%.2f,%.2f,%.3f,%.2f,%.2f,%.2f,%.2f,"
+
+	            // --- Camera 1 (4 parameters) ---
+	            "%.2f,%.2f,%.2f,%.2f,"
+
+	            // --- Camera 2 (4 parameters) ---
+	            "%.2f,%.2f,%.2f,%.2f,"
+
+	            // --- System Status (3 parameters) ---
+	            "%u,%u,%u"
+
+	            "\r\n",
+
+	            // --- Timestamp ---
+	            rtcData.date, rtcData.month, rtcData.year,
+	            rtcData.hour, rtcData.minute, rtcData.second,
+
+	            // --- Phase A ---
 	            elecData.phase[0].voltage,
-	            elecData.phase[1].voltage,
-	            elecData.phase[2].voltage,
+	            elecData.phase[0].current,
+	            elecData.phase[0].power,
+	            elecData.phase[0].frequency,
+	            elecData.phase[0].pf,
+	            elecData.phase[0].va,
+	            elecData.phase[0].var,
+	            elecData.phase[0].phi,
+	            elecData.phase[0].theta,
 
-	            thermData.avgTemp,
-	            thermData.maxTemp
+	            // --- Phase B ---
+	            elecData.phase[1].voltage,
+	            elecData.phase[1].current,
+	            elecData.phase[1].power,
+	            elecData.phase[1].frequency,
+	            elecData.phase[1].pf,
+	            elecData.phase[1].va,
+	            elecData.phase[1].var,
+	            elecData.phase[1].phi,
+	            elecData.phase[1].theta,
+
+	            // --- Phase C ---
+	            elecData.phase[2].voltage,
+	            elecData.phase[2].current,
+	            elecData.phase[2].power,
+	            elecData.phase[2].frequency,
+	            elecData.phase[2].pf,
+	            elecData.phase[2].va,
+	            elecData.phase[2].var,
+	            elecData.phase[2].phi,
+	            elecData.phase[2].theta,
+
+	            // --- Camera 1 ---
+	            camera1.is_initialized ? camera1.avg_temp : 0.0f,
+	            camera1.is_initialized ? camera1.max_temp : 0.0f,
+	            camera1.is_initialized ? camera1.min_temp : 0.0f,
+	            camera1.is_initialized ? camera1.ambient_temp : 0.0f,
+
+	            // --- Camera 2 ---
+	            camera2.is_initialized ? camera2.avg_temp : 0.0f,
+	            camera2.is_initialized ? camera2.max_temp : 0.0f,
+	            camera2.is_initialized ? camera2.min_temp : 0.0f,
+	            camera2.is_initialized ? camera2.ambient_temp : 0.0f,
+
+	            // --- System Status ---
+	            elecData.faultCode,
+	            mlx_debug.frame_success_count,
+	            mlx_debug.frame_fail_count
 	        );
 
 	        sd.append(&sd, "LOG.CSV", line);
 	    }
 
-	    HAL_Delay(100);   /* ritme loop */
+	    HAL_Delay(100);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -484,7 +610,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -518,7 +644,7 @@ static void MX_I2C2_Init(void)
 
   /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
-  hi2c2.Init.ClockSpeed = 400000;
+  hi2c2.Init.ClockSpeed = 100000;
   hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -741,10 +867,10 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 
-/**
-  * @brief  TX selesai — pindahkan ke mode RX interrupt.
-  *         Dipanggil otomatis oleh HAL setelah TX IT selesai.
-  */
+/* ============================================================================ */
+/*                     UART CALLBACKS (UNCHANGED)                               */
+/* ============================================================================ */
+
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2) {
@@ -752,10 +878,6 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
-/**
-  * @brief  1 byte RX diterima — kumpulkan ke buffer.
-  *         Dipanggil otomatis oleh HAL setiap 1 byte masuk via IT.
-  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2) {
@@ -763,9 +885,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
-/* ========================= */
-/* DS3231 Helper Functions   */
-/* ========================= */
+/* ============================================================================ */
+/*                     DS3231 RTC FUNCTIONS (UNCHANGED)                         */
+/* ============================================================================ */
 
 static uint8_t BCD_To_Dec(uint8_t val)
 {
@@ -781,18 +903,17 @@ static HAL_StatusTypeDef DS3231_GetTime(volatile RTC_DS3231_t *rtc)
 {
     uint8_t buffer[7];
 
-    if (HAL_I2C_Mem_Read(&hi2c3, DS3231_ADDRESS,
-                         0x00, I2C_MEMADD_SIZE_8BIT,
+    if (HAL_I2C_Mem_Read(&hi2c3, DS3231_ADDRESS, 0x00, I2C_MEMADD_SIZE_8BIT,
                          buffer, 7, HAL_MAX_DELAY) != HAL_OK)
         return HAL_ERROR;
 
     rtc->second = BCD_To_Dec(buffer[0]);
     rtc->minute = BCD_To_Dec(buffer[1]);
-    rtc->hour   = BCD_To_Dec(buffer[2] & 0x3F);
-    rtc->day    = BCD_To_Dec(buffer[3]);
-    rtc->date   = BCD_To_Dec(buffer[4]);
-    rtc->month  = BCD_To_Dec(buffer[5] & 0x1F);
-    rtc->year   = 2000 + BCD_To_Dec(buffer[6]);
+    rtc->hour = BCD_To_Dec(buffer[2] & 0x3F);
+    rtc->day = BCD_To_Dec(buffer[3]);
+    rtc->date = BCD_To_Dec(buffer[4]);
+    rtc->month = BCD_To_Dec(buffer[5] & 0x1F);
+    rtc->year = 2000 + BCD_To_Dec(buffer[6]);
 
     return HAL_OK;
 }
@@ -809,21 +930,21 @@ static HAL_StatusTypeDef DS3231_SetTime(RTC_DS3231_t *rtc)
     buffer[5] = Dec_To_BCD(rtc->month);
     buffer[6] = Dec_To_BCD(rtc->year - 2000);
 
-    return HAL_I2C_Mem_Write(&hi2c3, DS3231_ADDRESS,
-                             0x00, I2C_MEMADD_SIZE_8BIT,
+    return HAL_I2C_Mem_Write(&hi2c3, DS3231_ADDRESS, 0x00, I2C_MEMADD_SIZE_8BIT,
                              buffer, 7, HAL_MAX_DELAY);
 }
+
+/* ============================================================================ */
+/*                     SD CARD FUNCTIONS (UNCHANGED)                            */
+/* ============================================================================ */
 
 static uint8_t SD_mount(void *self)
 {
     SDCard_Class *sd = (SDCard_Class*)self;
-
-    if (f_mount(&sd->fs, "", 1) == FR_OK)
-    {
+    if (f_mount(&sd->fs, "", 1) == FR_OK) {
         sd->mounted = 1;
         return 1;
     }
-
     sd->mounted = 0;
     return 0;
 }
@@ -831,112 +952,141 @@ static uint8_t SD_mount(void *self)
 static uint8_t SD_createFile(void *self, const char *filename)
 {
     SDCard_Class *sd = (SDCard_Class*)self;
-
     if (!sd->mounted) return 0;
 
     sd->result = f_open(&sd->file, filename, FA_OPEN_ALWAYS | FA_WRITE);
-
-    if (sd->result == FR_OK)
-    {
+    if (sd->result == FR_OK) {
         f_lseek(&sd->file, f_size(&sd->file));
-
-        if (f_size(&sd->file) == 0)
-        {
+        if (f_size(&sd->file) == 0) {
             char header[] =
-            "Date,Time,VA,VB,VC,TempAvg,TempMax\r\n";
+                "Date,Time,"
+
+                // Phase A
+                "VA_Volt,VA_Curr,VA_Pow,VA_Freq,VA_PF,VA_VA,VA_VAR,VA_Phi,VA_Theta,"
+
+                // Phase B
+                "VB_Volt,VB_Curr,VB_Pow,VB_Freq,VB_PF,VB_VA,VB_VAR,VB_Phi,VB_Theta,"
+
+                // Phase C
+                "VC_Volt,VC_Curr,VC_Pow,VC_Freq,VC_PF,VC_VA,VC_VAR,VC_Phi,VC_Theta,"
+
+                // Camera 1
+                "Cam1_Avg,Cam1_Max,Cam1_Min,Cam1_Ambient,"
+
+                // Camera 2
+                "Cam2_Avg,Cam2_Max,Cam2_Min,Cam2_Ambient,"
+
+                // System
+                "FaultCode,MLX_Success,MLX_Fail"
+
+                "\r\n";
 
             f_write(&sd->file, header, strlen(header), &sd->bw);
         }
-
         f_close(&sd->file);
         return 1;
     }
-
     return 0;
 }
 
 static uint8_t SD_append(void *self, const char *filename, const char *text)
 {
     SDCard_Class *sd = (SDCard_Class*)self;
-
     if (!sd->mounted) return 0;
 
-    if (f_open(&sd->file, filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK)
-    {
+    if (f_open(&sd->file, filename, FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
         f_write(&sd->file, text, strlen(text), &sd->bw);
         f_close(&sd->file);
         return 1;
     }
-
     return 0;
 }
 
-/* ======================================================== */
-/* Fungsi bantu                                                */
-/* ======================================================== */
+
+/**
+ * @brief Test basic I2C communication with MLX90640
+ * @return 1 if OK, 0 if failed
+ */
+uint8_t Test_I2C_MLX90640(I2C_HandleTypeDef *hi2c, uint8_t addr)
+{
+    /* Test 1: Device Ready Check */
+    HAL_StatusTypeDef status = HAL_I2C_IsDeviceReady(hi2c, (addr << 1), 3, 100);
+
+    if (status != HAL_OK) {
+        /* Device not responding */
+        return 0;
+    }
+
+    /* Test 2: Try to read status register */
+    uint16_t test_data = 0;
+    uint8_t buffer[2];
+
+    status = HAL_I2C_Mem_Read(
+        hi2c,
+        (addr << 1),
+        0x8000,  /* Status register */
+        I2C_MEMADD_SIZE_16BIT,
+        buffer,
+        2,
+        1000
+    );
+
+    if (status != HAL_OK) {
+        /* Cannot read register */
+        return 0;
+    }
+
+    /* Byte swap */
+    test_data = (buffer[1] << 8) | buffer[0];
+
+    /* Status register should have reasonable value (not 0x0000 or 0xFFFF) */
+    if (test_data == 0x0000 || test_data == 0xFFFF) {
+        return 0;
+    }
+
+    return 1;  /* Success */
+}
+
+/* ============================================================================ */
+/*                     FAULT HANDLING (UNCHANGED)                               */
+/* ============================================================================ */
+
 static uint16_t CheckVoltageFault(float vA, float vB, float vC)
 {
-    const float vLow  = VOLT_NOMINAL * (1.0f - LTOL);
+    const float vLow = VOLT_NOMINAL * (1.0f - LTOL);
     const float vHigh = VOLT_NOMINAL * (1.0f + HTOL);
 
     if (vA > vHigh) return 4U;
     if (vB > vHigh) return 5U;
     if (vC > vHigh) return 6U;
 
-    if (vA < vLow)  return 1U;
-    if (vB < vLow)  return 2U;
-    if (vC < vLow)  return 3U;
+    if (vA < vLow) return 1U;
+    if (vB < vLow) return 2U;
+    if (vC < vLow) return 3U;
 
     return 0U;
 }
 
 static void UpdateFaultCode(uint16_t code)
 {
-    /* Tempat untuk aksi jika fault terjadi (LED, relay, dll.)
-       Saat ini hanya menyimpan di elecData.faultCode */
     (void)code;
 }
 
-// FAULT CODE
 void FaultCode(uint16_t code)
 {
     switch (code) {
-        case 0U:
-            /* No fault - semua normal */
-            break;
-
-        case 1U:
-            /* Undervoltage Phase A */
-            break;
-
-        case 2U:
-            /* Undervoltage Phase B */
-            break;
-
-        case 3U:
-            /* Undervoltage Phase C */
-            break;
-
-        case 4U:
-            /* Overvoltage Phase A */
-            break;
-
-        case 5U:
-            /* Overvoltage Phase B */
-            break;
-
-        case 6U:
-            /* Overvoltage Phase C */
-            break;
-
-        case 404U:
-            /* Koneksi PZEM hilang / kabel putus / terbalik */
-            break;
-
-        default:
-            break;
+        case 0U:   /* No fault */ break;
+        case 1U:   /* Undervoltage Phase A */ break;
+        case 2U:   /* Undervoltage Phase B */ break;
+        case 3U:   /* Undervoltage Phase C */ break;
+        case 4U:   /* Overvoltage Phase A */ break;
+        case 5U:   /* Overvoltage Phase B */ break;
+        case 6U:   /* Overvoltage Phase C */ break;
+        case 404U: /* PZEM connection lost */ break;
+        default: break;
     }
 }
+
 /* USER CODE END 4 */
 
 /**
