@@ -1,3 +1,0 @@
-../MLX90640/Src/mlx90640_i2c.c:27:19:MLX90640_I2C_Read	64	static
-../MLX90640/Src/mlx90640_i2c.c:106:19:MLX90640_I2C_Write	48	static
-../MLX90640/Src/mlx90640_i2c.c:158:19:MLX90640_I2C_GeneralReset	16	static

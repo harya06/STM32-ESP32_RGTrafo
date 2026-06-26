@@ -1,4 +1,5 @@
-../Core/Src/MLX90640_I2C_Driver.c:8:6:MLX90640_I2CInit	1
-../Core/Src/MLX90640_I2C_Driver.c:16:5:MLX90640_I2CGeneralReset	1
-../Core/Src/MLX90640_I2C_Driver.c:21:5:MLX90640_I2CRead	4
-../Core/Src/MLX90640_I2C_Driver.c:53:5:MLX90640_I2CWrite	5
+../Core/Src/MLX90640_I2C_Driver.c:12:6:MLX90640_I2CSelectBus	1
+../Core/Src/MLX90640_I2C_Driver.c:17:6:MLX90640_I2CInit	2
+../Core/Src/MLX90640_I2C_Driver.c:25:5:MLX90640_I2CGeneralReset	1
+../Core/Src/MLX90640_I2C_Driver.c:30:5:MLX90640_I2CRead	5
+../Core/Src/MLX90640_I2C_Driver.c:60:5:MLX90640_I2CWrite	6

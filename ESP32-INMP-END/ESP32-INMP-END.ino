@@ -2,6 +2,7 @@
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
 #include <math.h>
+#include <string.h>
 
 // --- RS485 ---
 #define PIN_RS485_RXD 16
@@ -26,6 +27,24 @@
 #define INMP441_SCALE 8388608.0f
 #define SEND_INTERVAL_MS 200
 
+// ================================================================
+// TLV + CRC16 PROTOCOL LAYER  (menggantikan sendRS485 CSV lama)
+// ================================================================
+#define TLV_SYNC1 0xAA
+#define TLV_SYNC2 0x55
+#define TLV_TYPE_MIC_DATA 0x10
+
+#define TLV_TAG_RMS 0x01
+#define TLV_TAG_PEAK 0x02
+#define TLV_TAG_BAND 0x03
+#define TLV_TAG_DB 0x04
+
+#define TLV_VAL_LEN_FLOAT 4U                                 // panjang VALUE tiap TLV float32
+#define TLV_PAYLOAD_LEN 24U                                  // 4 TLV x (TAG 1 + LEN 1 + VALUE 4) = 24
+#define TLV_FRAME_LEN (2U + 1U + 2U + TLV_PAYLOAD_LEN + 2U)  // = 30
+
+static uint8_t tlv_frame_buf[TLV_FRAME_LEN];
+
 static int32_t i2s_raw_buf[FFT_SIZE];
 static double fft_vReal[FFT_SIZE];
 static double fft_vImag[FFT_SIZE];
@@ -44,7 +63,11 @@ void applyHammingWindow(double* buf, uint16_t len);
 float computeRMS(const double* buf, uint16_t len);
 float computePeak(const double* buf, uint16_t len);
 float computeBandEnergy(const double* vReal, uint16_t bin_min, uint16_t bin_max);
-void sendRS485(float rms, float peak, float band);
+float calculateDecibel(float amplitude);
+
+uint16_t crc16_ccitt(const uint8_t* data, uint16_t len);
+uint16_t buildTLVPacket(uint8_t* out, float rms, float peak, float band, float dB);
+void sendTLVPacket(float rms, float peak, float band, float dB);
 
 void setup() {
   Serial.begin(115200);
@@ -80,13 +103,15 @@ void loop() {
 
   float mic_band = computeBandEnergy(fft_vReal, FFT_BIN_MIN, FFT_BIN_MAX);
 
+  float dB = calculateDecibel(mic_rms);
+
   uint32_t now = millis();
   if ((now - last_send_ms) >= SEND_INTERVAL_MS) {
-    sendRS485(mic_rms, mic_peak, mic_band);
+    sendTLVPacket(mic_rms, mic_peak, mic_band, dB);
     last_send_ms = now;
 
-    Serial.printf("[DATA] RMS=%.4f PEAK=%.4f BAND=%.4f\n",
-                  mic_rms, mic_peak, mic_band);
+    Serial.printf("[DATA] RMS=%.4f PEAK=%.4f BAND=%.4f dB=%.4f\n",
+                  mic_rms, mic_peak, mic_band, dB);
   }
 }
 
@@ -206,22 +231,116 @@ float computeBandEnergy(const double* vReal, uint16_t bin_min, uint16_t bin_max)
   return (float)sqrt(energy);
 }
 
-void sendRS485(float rms, float peak, float band)
-{
-    char msg[80];
-    snprintf(msg, sizeof(msg),
-             "RMS:%.4f,PEAK:%.4f,BAND:%.4f\r\n",
-             rms, peak, band);
+float calculateDecibel(float amplitude) {
+  if (amplitude < 0.00001f) return 0;  // Mencegah log(0)
 
-    digitalWrite(PIN_RS485_DIR, HIGH);
-    delayMicroseconds(100);  // settling sebelum TX
-    
-    RS485Serial.print(msg);
-    RS485Serial.flush();     // tunggu TX buffer kosong
+  float dbfs = 20.0f * log10f(amplitude);  // Amplitudo referensi = 1 karena out I2S sudah ternormalisasi
 
-    uint32_t tx_len = strlen(msg);
-    uint32_t wait_us = (tx_len * 10 * 1000000UL / RS485_BAUD) + 500;
-    delayMicroseconds(wait_us);
-    
-    digitalWrite(PIN_RS485_DIR, LOW);
+  float dbspl = dbfs + 120.0f;  // Penambahan offset
+  return dbspl;
+}
+
+// ================================================================
+// TLV + CRC16 — implementasi
+// ================================================================
+
+/**
+ * crc16_ccitt()
+ *
+ * CRC16-CCITT, polynomial 0x1021, initial value 0xFFFF.
+ * Dihitung di atas array byte (TYPE + LENGTH + PAYLOAD), TIDAK
+ * termasuk SYNC1, SYNC2, maupun CRC itu sendiri.
+ */
+uint16_t crc16_ccitt(const uint8_t* data, uint16_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint16_t i = 0; i < len; i++) {
+    crc ^= ((uint16_t)data[i] << 8);
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ 0x1021;
+      } else {
+        crc = (crc << 1);
+      }
+    }
+  }
+  return crc;
+}
+
+/**
+ * buildTLVPacket()
+ *
+ * Menyusun frame lengkap ke buffer 'out':
+ *   [SYNC1][SYNC2][TYPE][LENGTH][PAYLOAD(4xTLV)][CRC_L][CRC_H]
+ *
+ * PAYLOAD berisi 4 TLV berurutan, masing-masing:
+ *   [TAG:1][LEN:1][VALUE:4 byte float32 little-endian]
+ *
+ * Return: panjang total frame dalam byte (selalu TLV_FRAME_LEN = 30).
+ */
+uint16_t buildTLVPacket(uint8_t* out, float rms, float peak, float band, float dB) {
+  uint16_t idx = 0;
+
+  out[idx++] = TLV_SYNC1;
+  out[idx++] = TLV_SYNC2;
+
+  uint16_t crcStartIdx = idx;  // mulai dihitung CRC dari sini (TYPE)
+
+  out[idx++] = TLV_TYPE_MIC_DATA;
+  out[idx++] = (uint8_t)(TLV_PAYLOAD_LEN & 0xFF);         // LEN_L = 0x18
+  out[idx++] = (uint8_t)((TLV_PAYLOAD_LEN >> 8) & 0xFF);  // LEN_H = 0x00
+
+  // ---- TLV 1: RMS ----
+  out[idx++] = TLV_TAG_RMS;
+  out[idx++] = TLV_VAL_LEN_FLOAT;
+  memcpy(&out[idx], &rms, sizeof(float));
+  idx += sizeof(float);
+
+  // ---- TLV 2: PEAK ----
+  out[idx++] = TLV_TAG_PEAK;
+  out[idx++] = TLV_VAL_LEN_FLOAT;
+  memcpy(&out[idx], &peak, sizeof(float));
+  idx += sizeof(float);
+
+  // ---- TLV 3: BAND ----
+  out[idx++] = TLV_TAG_BAND;
+  out[idx++] = TLV_VAL_LEN_FLOAT;
+  memcpy(&out[idx], &band, sizeof(float));
+  idx += sizeof(float);
+
+  // ---- TLV 4: dB ----
+  out[idx++] = TLV_TAG_DB;
+  out[idx++] = TLV_VAL_LEN_FLOAT;
+  memcpy(&out[idx], &dB, sizeof(float));
+  idx += sizeof(float);
+
+  uint16_t crcLen = idx - crcStartIdx;  // = 1(TYPE) + 1(LEN) + 24(PAYLOAD) = 26
+  uint16_t crc = crc16_ccitt(&out[crcStartIdx], crcLen);
+
+  out[idx++] = (uint8_t)(crc & 0xFF);         // CRC low byte
+  out[idx++] = (uint8_t)((crc >> 8) & 0xFF);  // CRC high byte
+
+  return idx;  // = TLV_FRAME_LEN (30)
+}
+
+/**
+ * sendTLVPacket()
+ *
+ * Menggantikan sendRS485() lama. Membangun frame TLV+CRC16, lalu
+ * mengirim lewat RS485 dengan kontrol arah DIR pin yang sama persis
+ * seperti sebelumnya (HIGH sebelum TX, settle 100us, flush, hitung
+ * waktu transmisi untuk delay, lalu LOW kembali).
+ */
+void sendTLVPacket(float rms, float peak, float band, float dB) {
+  uint16_t frameLen = buildTLVPacket(tlv_frame_buf, rms, peak, band, dB);
+
+  digitalWrite(PIN_RS485_DIR, HIGH);
+  delayMicroseconds(100);  // settling sebelum TX
+
+  RS485Serial.write(tlv_frame_buf, frameLen);
+  RS485Serial.flush();  // tunggu TX buffer kosong
+
+  uint32_t wait_us = ((uint32_t)frameLen * 10 * 1000000UL / RS485_BAUD) + 500;
+  delayMicroseconds(wait_us);
+
+  digitalWrite(PIN_RS485_DIR, LOW);
 }
